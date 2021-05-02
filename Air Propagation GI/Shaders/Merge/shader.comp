@@ -1,0 +1,33 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0, rgba32f) uniform readonly image2D inDirectLighting;
+layout (binding = 1, rgba8) uniform image2D resultImage;
+
+float A = 0.15;
+float B = 0.50;
+float C = 0.10;
+float D = 0.20;
+float E = 0.02;
+float F = 0.30;
+float W = 11.2;
+
+vec3 Uncharted2Tonemap(vec3 x)
+{
+   return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+
+void main()
+{
+    vec3 directLighting = imageLoad(inDirectLighting, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).rgb;
+
+    vec3 curr = Uncharted2Tonemap(0.7 * directLighting);
+    vec3 whiteScale = vec3(1.0) / Uncharted2Tonemap(vec3(W));
+    vec3 color = curr*whiteScale;
+
+    color = pow(color, vec3(1.0 / 2.2));
+
+    imageStore(resultImage, ivec2(gl_GlobalInvocationID.xy), vec4(color, 1.0));
+}

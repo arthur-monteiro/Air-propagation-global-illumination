@@ -1,0 +1,226 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0, r32f) uniform readonly image2D inDepth;
+layout (binding = 1, rgba8) uniform readonly image2D inAlbedo;
+layout (binding = 2, rgba8) uniform readonly image2D inNormalRoughnessMetal;
+layout (binding = 3, r32f) uniform readonly image2D inShadowMask;
+layout (binding = 4, r32f) uniform readonly image2D inVolumetricLight;
+layout (binding = 5, rgba8) uniform writeonly image2D outReflectionIntensity;
+layout (binding = 6, rgba32f) uniform image2D resultImage;
+
+layout(binding = 7, std140) uniform readonly UniformBufferObjectLighting
+{
+    mat4 invProjection;
+    mat4 invView;
+    mat4 voxelProjection;
+    vec4 projParams;
+	vec4 directionDirectionalLight;
+	vec4 colorDirectionalLight;
+} uboLighting;
+
+layout(binding = 8, std140) uniform UniformBufferObjectRadiosityProbes
+{
+	vec4 radiosity[1000];
+} uboRadiosityProbes;
+
+float DistributionGGX(vec3 N, vec3 H, float roughness);
+float GeometrySchlickGGX(float NdotV, float roughness);
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness);
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness);
+
+const float PI = 3.14159265359;
+
+vec3 decodeNormal (vec2 enc, vec3 view)
+{
+    vec2 fenc = enc * 4.0 - vec2(2.0);
+    float f = dot(fenc,fenc);
+    float g = sqrt(1.0 - f / 4.0);
+    vec3 n;
+    n.xy = fenc * g;
+    n.z = 1.0 - f / 2.0;
+    return n;
+}
+
+vec3 interpolate1D(vec3 v1, vec3 v2, float x)
+{
+    return v1*(1-x) + v2*x;
+}
+
+vec3 interpolate2D(vec3 v1, vec3 v2, vec3 v3, vec3 v4, float x, float y)
+{
+
+    vec3 s = interpolate1D(v1, v2, x);
+    vec3 t = interpolate1D(v3, v4, x);
+    return interpolate1D(s, t, y);
+}
+
+vec3 interpolate3D(vec3 v1, vec3 v2, vec3 v3, vec3 v4, vec3 v5, vec3 v6, vec3 v7, vec3 v8, float x, float y, float z)
+{
+    vec3 s = interpolate2D(v1, v2, v3, v4, x, y);
+    vec3 t = interpolate2D(v5, v6, v7, v8, x, y);
+    return interpolate1D(s, t, z);
+}
+
+float getRadiosity(int i, int j, int k)
+{
+	if(i >= 0 && j >= 0 && j >= 0 && i <= 9 && j <= 9 && k <= 9)
+		return uboRadiosityProbes.radiosity[100 * i + 10 * j + k].x;
+
+	return 0.0;
+}
+
+void main()
+{
+    const vec2 inUV = gl_GlobalInvocationID.xy / vec2(imageSize(inDepth));
+    vec2 d = inUV * 2.0 - 1.0;
+
+    vec4 viewRay = uboLighting.invProjection * vec4(d.x, d.y, 1.0, 1.0);
+    float depth = imageLoad(inDepth, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).r;
+    float linearDepth = uboLighting.projParams.y / (depth - uboLighting.projParams.x);
+    vec3 viewPos = viewRay.xyz * linearDepth;
+    vec3 worldPos = (uboLighting.invView * vec4(viewPos, 1.0)).xyz;
+
+    vec3 normal = decodeNormal(imageLoad(inNormalRoughnessMetal, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).rg, viewPos);
+    vec3 albedo = imageLoad(inAlbedo, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).rgb;
+
+    // Get AO
+    vec2 texCoord = vec2(float(gl_GlobalInvocationID.x) / 8.0, float(gl_GlobalInvocationID.y) / 8.0) - vec2(0.5);
+    ivec2 iuv = ivec2(floor(texCoord));
+    vec2 fuv = fract(texCoord);
+
+    /*float ao1 = imageLoad(inAO, ivec2(iuv.x, iuv.y)).r;
+    float ao2 = imageLoad(inAO, ivec2(iuv.x + 1, iuv.y)).r;
+    float ao3 = imageLoad(inAO, ivec2(iuv.x, iuv.y + 1)).r;
+    float ao4 = imageLoad(inAO, ivec2(iuv.x + 1, iuv.y + 1)).r;
+
+    float ao = mix(mix(ao1, ao2, fuv.x), mix(ao3, ao4, fuv.x), fuv.y );*/
+
+    //float ao = imageLoad(inAO, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).r;
+    
+    /*imageStore(resultImage, ivec2(gl_GlobalInvocationID.xy), vec4(ao.rrr, 1.0));
+    return;*/
+    
+    float shadow = imageLoad(inShadowMask, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).r;
+
+    float fog1 = imageLoad(inVolumetricLight, ivec2(iuv.x, iuv.y)).r;
+    float fog2 = imageLoad(inVolumetricLight, ivec2(iuv.x + 1, iuv.y)).r;
+    float fog3 = imageLoad(inVolumetricLight, ivec2(iuv.x, iuv.y + 1)).r;
+    float fog4 = imageLoad(inVolumetricLight, ivec2(iuv.x + 1, iuv.y + 1)).r;
+
+    float fog = mix(mix(fog1, fog2, fuv.x), mix(fog3, fog4, fuv.x), fuv.y );
+
+    float roughness = imageLoad(inNormalRoughnessMetal, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).b;
+    float metallic = imageLoad(inNormalRoughnessMetal, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).a;
+
+    vec3 V = normalize(-viewPos);
+    vec3 R = reflect(-V, normal);
+
+    vec3 F0 = vec3(0.04);
+    F0 = mix(F0,albedo, metallic);
+
+    vec3 Lo = vec3(0.0);
+
+    // calculate per-light radiance
+    vec3 L = normalize(-uboLighting.directionDirectionalLight.xyz);
+    vec3 H = normalize(V + L);
+    vec3 radiance = uboLighting.colorDirectionalLight.xyz;
+
+    // cook-torrance brdf
+    float NDF = DistributionGGX(normal, H, roughness);
+    float G   = GeometrySmith(normal, V, L, roughness);
+    vec3 F    = fresnelSchlickRoughness(max(dot(H, V), 0.0), F0, roughness);
+
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - metallic;
+
+    vec3 nominator    = NDF * G * F;
+    float denominator = 4 * max(dot(normal, V), 0.0) * max(dot(normal, L), 0.0);
+    vec3 specular     = nominator / max(denominator, 0.001);
+
+    // add to outgoing radiance Lo
+    float NdotL = max(dot(normal, L), 0.0);
+    Lo += (kD * albedo / PI + specular) * radiance * NdotL;
+
+    float probeI = (worldPos.x - 20.0) / -4.0;
+	float probeJ = (worldPos.y - 0.1) / 1.7;
+	float probeK = (worldPos.z + 10.0) / 2.5;
+
+	int probeI0 = int(floor(probeI));
+	int probeI1 = probeI0 + 1;
+	float dProbI = fract(probeI);
+
+	int probeJ0 = int(floor(probeJ));
+	int probeJ1 = probeJ0 + 1;
+	float dProbJ = fract(probeJ);
+
+	int probeK0 = int(floor(probeK));
+	int probeK1 = probeK0 + 1;
+	float dProbK = fract(probeK);
+
+    float ambientCoeff = 0.0;
+	ambientCoeff += getRadiosity(probeI0, probeJ0, probeK0) * (1.0 - dProbI) * (1.0 - dProbJ) * (1.0 - dProbK);
+	ambientCoeff += getRadiosity(probeI0, probeJ0, probeK1) * (1.0 - dProbI) * (1.0 - dProbJ) * dProbK;
+	ambientCoeff += getRadiosity(probeI0, probeJ1, probeK0) * (1.0 - dProbI) * dProbJ * (1.0 - dProbK);
+	ambientCoeff += getRadiosity(probeI0, probeJ1, probeK1) * (1.0 - dProbI) * dProbJ * dProbK;
+	ambientCoeff += getRadiosity(probeI1, probeJ0, probeK0) * dProbI * (1.0 - dProbJ) * (1.0 - dProbK);
+	ambientCoeff += getRadiosity(probeI1, probeJ0, probeK1) * dProbI * (1.0 - dProbJ) * dProbK;
+	ambientCoeff += getRadiosity(probeI1, probeJ1, probeK0) * dProbI * dProbJ * (1.0 - dProbK);
+	ambientCoeff += getRadiosity(probeI1, probeJ1, probeK1) * dProbI * dProbJ * dProbK;
+	ambientCoeff /= 8.0;
+
+    vec3 ambient = albedo * ambientCoeff;
+    Lo *= shadow.r;
+
+    vec3 color = ambient + Lo; // + (fog / 12.0) * normalize(uboLighting.colorDirectionalLight.xyz);
+
+    imageStore(resultImage, ivec2(gl_GlobalInvocationID.xy), vec4(color, 1.0));
+
+    vec3 reflectionInt = fresnelSchlickRoughness(max(dot(normalize(V - reflect(V, normal)), V), 0.0), F0, roughness);
+    const float minReflection = 0.05;
+    if(reflectionInt.x < minReflection && reflectionInt.y < minReflection && reflectionInt.z < minReflection)
+        reflectionInt = vec3(0.0);
+    imageStore(outReflectionIntensity, ivec2(gl_GlobalInvocationID.xy), vec4(reflectionInt, 1.0));
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a      = roughness*roughness;
+    float a2     = a*a;
+    float NdotH  = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH*NdotH;
+
+    float nom   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r*r) / 8.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2  = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1  = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+	return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
+}

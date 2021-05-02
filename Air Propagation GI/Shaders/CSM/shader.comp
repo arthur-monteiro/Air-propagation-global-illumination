@@ -1,0 +1,133 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#define CASCADES_COUNT 4
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0, r32f) uniform readonly image2D inDepth;
+layout (binding = 1, r32f) uniform readonly image2D[] inShadowMaps;
+layout (binding = 5, rgba32f) uniform image2D resultShadowMask;
+layout (binding = 6, r32f) uniform image2D resultVolumetricLight;
+
+layout(binding = 7, std140) uniform readonly UniformBufferObject
+{
+    mat4 invModelView;
+    mat4 invProjection;
+	vec4 projectionParams;
+    mat4[4] lightSpaceMatrices;
+    vec4 cascadeSplits;
+} ubo;
+
+const float PI = 3.14159265359;
+const float BIAS = 0.0001;
+
+const mat4 biasMat = mat4( 
+	0.5, 0.0, 0.0, 0.0,
+	0.0, 0.5, 0.0, 0.0,
+	0.0, 0.0, 1.0, 0.0,
+	0.5, 0.5, 0.0, 1.0 );
+
+vec2 vogelDiskSample(int sampleIndex, int samplesCount, float phi)
+{
+  float GoldenAngle = 2.4;
+
+  float r = sqrt(sampleIndex + 0.5) / sqrt(samplesCount);
+  float theta = sampleIndex * GoldenAngle + phi;
+
+  float sine = sin(theta);
+  float cosine = cos(theta);
+  
+  return vec2(r * cosine, r * sine);
+}
+
+float interleavedGradientNoise(vec2 position_screen)
+{
+  vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+  return fract(magic.z * fract(dot(position_screen, magic.xy)));
+}
+
+float textureProj(ivec2 shadowMapCoords, uint cascadeIndex, float currentDepth)
+{
+	float closestDepth = imageLoad(inShadowMaps[cascadeIndex], shadowMapCoords).r; 
+
+    float shadow = currentDepth - BIAS > closestDepth  ? 1.0 : 0.0;
+
+	return shadow;
+}
+
+float isShadowed(in vec3 viewPos)
+{
+    uint cascadeIndex = 0;
+	for(uint i = 0; i < CASCADES_COUNT; ++i) 
+	{
+		if(-viewPos.z <= ubo.cascadeSplits[i])
+		{	
+			cascadeIndex = i;
+			break;
+		}
+	}
+    vec4 rawPos = ubo.invModelView * vec4(viewPos, 1.0);
+    vec4 posLightSpace = biasMat * ubo.lightSpaceMatrices[cascadeIndex] * rawPos;
+    vec3 projCoords = posLightSpace.xyz / posLightSpace.w; 
+
+    ivec2 shadowMapSize = imageSize(inShadowMaps[cascadeIndex]);
+    
+
+    int nIteration = 16;
+    float divisor = 700.0; 
+
+    float r = 0.0;
+    for(int i = 0; i < nIteration; ++i)
+    {
+        vec3 tempProjCoords = projCoords + vec3(vogelDiskSample(i, nIteration, interleavedGradientNoise(gl_GlobalInvocationID.xy)) / divisor, 0.0);
+        ivec2 projInt = ivec2(tempProjCoords.x * shadowMapSize.x, tempProjCoords.y * shadowMapSize.y);
+        r += textureProj(projInt, cascadeIndex, tempProjCoords.z);
+    }
+    r /= 16.0;
+
+    return r;
+}
+
+const int N_STEP = 8;
+
+float ditherPattern[4][4] = {
+    { 0.0f, 0.5f, 0.125f, 0.625f},
+    { 0.75f, 0.22f, 0.875f, 0.375f},
+    { 0.1875f, 0.6875f, 0.0625f, 0.5625},
+    { 0.9375f, 0.4375f, 0.8125f, 0.3125}
+};
+
+
+void main()
+{
+    const vec2 inUV = gl_GlobalInvocationID.xy / vec2(imageSize(inDepth));
+    vec2 d = inUV * 2.0 - 1.0;
+
+    vec4 viewRay = ubo.invProjection * vec4(d.x, d.y, 1.0, 1.0);
+    float depth = imageLoad(inDepth, ivec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y)).r;
+    float linearDepth = ubo.projectionParams.y / (depth - ubo.projectionParams.x);
+    vec3 viewPos = viewRay.xyz * linearDepth;
+    float shadow = isShadowed(viewPos);
+
+    float fogAccumulation = 0.0;
+    float fogDistance = length(viewPos);
+    vec3 stepVec = viewPos / float(N_STEP);
+
+    float ditherValue = ditherPattern[gl_GlobalInvocationID.x % 4][gl_GlobalInvocationID.y % 4];
+    viewPos = viewPos + (stepVec * ditherValue);
+
+    for(int i = 0; i < N_STEP - 1; ++i)
+    {
+        viewPos = viewPos - stepVec;
+        fogAccumulation += (1.0 - isShadowed(viewPos));
+    }
+
+    fogAccumulation /= float(N_STEP);
+    fogAccumulation *= fogDistance;
+    fogAccumulation = min(fogAccumulation, 2.0);
+
+    imageStore(resultShadowMask, ivec2(gl_GlobalInvocationID.xy), vec4((1.0 - shadow).rrr, 1.0));
+    imageStore(resultVolumetricLight, ivec2(gl_GlobalInvocationID.xy), vec4(fogAccumulation.rrr, 1.0));
+}
