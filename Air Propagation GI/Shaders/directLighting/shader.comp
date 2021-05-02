@@ -170,7 +170,7 @@ void main()
 	ambientCoeff += getRadiosity(probeI1, probeJ0, probeK1) * dProbI * (1.0 - dProbJ) * dProbK;
 	ambientCoeff += getRadiosity(probeI1, probeJ1, probeK0) * dProbI * dProbJ * (1.0 - dProbK);
 	ambientCoeff += getRadiosity(probeI1, probeJ1, probeK1) * dProbI * dProbJ * dProbK;
-	ambientCoeff /= 8.0;
+	ambientCoeff /= 6.0;
 
     vec3 ambient = albedo * ambientCoeff;
     Lo *= shadow.r;

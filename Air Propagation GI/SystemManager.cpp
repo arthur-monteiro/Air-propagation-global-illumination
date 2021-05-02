@@ -44,8 +44,8 @@ void SystemManager::createWolfInstance()
 	instanceCreateInfo.minorVersion = 0;
 
 	// Window
-	instanceCreateInfo.windowHeight = 720;
-	instanceCreateInfo.windowWidth = 1280;
+	instanceCreateInfo.windowHeight = 1080;
+	instanceCreateInfo.windowWidth = 1920;
 
 	// Debug
 	instanceCreateInfo.debugCallback = debugCallback;
